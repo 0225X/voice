@@ -1,0 +1,353 @@
+import random
+import numpy as np
+import torch
+
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+import os
+import torch
+from python_speech_features import mfcc
+from scipy.io import wavfile
+from torch.nn.utils.rnn import pad_sequence
+
+
+def preprocess_data(data_dir):
+    # Load dataset
+    wav_files = []
+    labels = []
+
+    for root, _, files in os.walk(data_dir):
+        for filename in files:
+            if filename.lower().endswith('.wav'):
+                filepath = os.path.join(root, filename)
+                wav_files.append(filepath)
+                labels.append(os.path.splitext(filename)[0])
+
+    mfccs = []
+    for wav_file in wav_files:
+        sample_rate, signal = wavfile.read(wav_file)
+        mfcc_feat = mfcc(signal, sample_rate, numcep=40)
+        mfccs.append(torch.FloatTensor(mfcc_feat))
+
+    # Pad sequences
+    mfccs = pad_sequence(mfccs, batch_first=True)
+
+    # Combine features and labels into list of tuples
+    data = list(zip(mfccs, labels))
+
+    return data
+
+from torch.utils.data import Dataset
+
+
+class THCHS30Dataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        mfccs, label = self.data[idx]
+
+        return mfccs, label
+import torch
+from torch.utils.data import DataLoader
+
+from B_Data_preprocess import preprocess_data
+from H_THCHS30Dataset import THCHS30Dataset
+from J_epoch import batch_size
+from L_MA import device
+
+
+def collate_fn(batch, max_seq_len):
+    batch = sorted(batch, key=lambda x: x[0].size(0), reverse=True)
+    mfccs = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+
+    mfccs = [mfcc[:max_seq_len, :] for mfcc in mfccs]
+    mfccs_padded = torch.stack(mfccs, dim=0).to(device)
+
+    return mfccs_padded, labels
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+data_dir = "D:\\30596\\桌面\\data"
+data = preprocess_data(data_dir)
+
+num_samples = len(data)
+num_train = int(num_samples * 0.8)
+num_valid = int(num_samples * 0.1)
+num_test = num_samples - num_train - num_valid
+
+train_data = data[:num_train]
+valid_data = data[num_train:num_train + num_valid]
+test_data = data[num_train + num_valid:]
+
+max_seq_len = 100
+batch_size = 32
+train_loader = DataLoader(THCHS30Dataset(train_data), batch_size=batch_size, shuffle=True,
+                          collate_fn=lambda x: collate_fn(x, max_seq_len))
+valid_loader = DataLoader(THCHS30Dataset(valid_data), batch_size=batch_size, shuffle=False,
+                          collate_fn=lambda x: collate_fn(x, max_seq_len))
+test_loader = DataLoader(THCHS30Dataset(test_data), batch_size=batch_size, shuffle=False,
+                         collate_fn=lambda x: collate_fn(x, max_seq_len))
+
+print('Training data loaded')
+print(f'\tNumber of batches: {len(train_loader)}')
+print(f'\tTotal number of samples: {len(train_loader) * batch_size}')
+
+print('Validation data loaded')
+print(f'\tNumber of batches: {len(valid_loader)}')
+print(f'\tTotal number of samples: {len(valid_loader) * batch_size}')
+
+print('Test data loaded')
+print(f'\tNumber of batches: {len(test_loader)}')
+print(f'\tTotal number of samples: {len(test_loader) * batch_size}')
+
+print(f"X_train: {train_data[:3]}")
+print(f"X_valid: {valid_data[:3]}")
+print(f"X_test: {test_data[:3]}")
+print(f"y_train: {[data[1] for data in train_data[:3]]}")
+print(f"y_valid: {[data[1] for data in valid_data[:3]]}")
+print(f"y_test: {[data[1] for data in test_data[:3]]}")
+
+import math
+import torch
+import torch.nn as nn
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_seq_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=0.1)
+
+        # Compute the positional encodings in advance
+        pe = torch.zeros(max_seq_len, d_model)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # Add batch dimension
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # Add the positional encodings to the input tensor
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+import math
+import torch
+from torch import nn
+
+
+# 定义 MultiHeadAttention 类，用于计算多头注意力机制
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+        self.out_linear = nn.Linear(d_model, d_model)
+
+    def forward(self, query, key, value, mask=None):
+        batch_size = query.shape[0]
+
+        # Pass the query, key, and value through separate linear layers to obtain projected representations
+        Q = self.q_linear(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # [batch_size, num_heads, seq_len, head_dim]
+        K = self.k_linear(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # [batch_size, num_heads, seq_len, head_dim]
+        V = self.v_linear(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # [batch_size, num_heads, seq_len, head_dim]
+        # Compute the scaled dot product attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(
+            self.head_dim)  # [batch_size, num_heads, seq_len, seq_len]
+
+        # Apply the attention mask (if provided)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        # Apply the softmax function to obtain attention weights
+        attention_weights = torch.softmax(scores, dim=-1)
+
+        # Apply dropout to the attention weights
+        attention_weights = self.dropout(attention_weights)
+
+        # Compute the attention output and pass it through the output linear layer
+        attention_output = torch.matmul(attention_weights, V)  # [batch_size, num_heads, seq_len, head_dim]
+        attention_output = attention_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        # [batch_size, seq_len, d_model]
+        output = self.out_linear(attention_output)  # [batch_size, seq_len, d_model]
+
+        return output
+from torch import nn
+
+
+# 定义 Residual 类，用于实现残差连接
+class Residual(nn.Module):
+    def init(self, sublayer, d_model, dropout):
+        super().init()
+        self.sublayer = sublayer
+        self.dropout = nn.Dropout(p=dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, *args, **kwargs):
+        return x + self.dropout(self.sublayer(self.norm(x), *args, **kwargs))
+from torch import nn
+
+from D_MultiHeadAttention import MultiHeadAttention
+from E_Residual import Residual
+
+
+# 定义 TransformerEncoderLayer 类，用于实现 Transformer 编码器的一个层
+class TransformerEncoderLayer(nn.Module):
+    def init(self, d_model, num_heads, dropout=0.1):
+        super().init()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.feed_forward = nn.Sequential(
+        nn.Linear(d_model, 4 * d_model),
+        nn.ReLU(),
+        nn.Linear(4 * d_model, d_model),
+        nn.Dropout(p=dropout)
+        )
+        self.residual1 = Residual(self.self_attn, d_model, dropout)
+        self.residual2 = Residual(self.feed_forward, d_model, dropout)
+
+    def forward(self, x, mask=None):
+        x = self.residual1(x, x, x, mask)
+        x = self.residual2(x)
+        return x
+from torch import nn
+from C_PositionalEncoding import PositionalEncoding
+
+
+class MFCC2HashTransformer(nn.Module):
+    def __init__(self, input_dim, output_dim, num_heads, num_layers):
+        super().__init__()
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads),
+            num_layers=num_layers
+        )
+
+        self.decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model=input_dim, nhead=num_heads),
+            num_layers=num_layers
+        )
+
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.pos_encoder = PositionalEncoding(input_dim)
+
+    def forward(self, src, tgt):
+        src = src.permute(1, 0, 2)  # [seq_len, batch_size, input_dim]
+        if tgt.is_sparse:
+            tgt = tgt.to_dense()
+        tgt = tgt.permute(1, 0, 2)  # [seq_len, batch_size, input_dim]
+        src = self.pos_encoder(src)
+        tgt = self.pos_encoder(tgt)
+
+        encoder_output = self.encoder(src)
+
+        tgt = tgt.unsqueeze(0)
+        decoder_output = self.decoder(tgt, encoder_output)
+
+        decoder_output = decoder_output.permute(1, 0, 2)  # [batch_size, seq_len, input_dim]
+        decoder_output = decoder_output[:, -1]  # Only use the last timestep of the decoder output
+
+        output = self.linear(decoder_output)
+
+        return output
+import torch
+
+
+def train(model, optimizer, criterion, train_loader, device):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    for batch_idx, (mfcc, hash_code) in enumerate(train_loader):
+        mfcc, hash_code = mfcc.to(device), hash_code.to(device)
+        optimizer.zero_grad()
+        output = model(mfcc, hash_code[:, :-1])
+        loss = criterion(output, hash_code[:, 1:])
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        predicted = torch.argmax(output, dim=1)
+        correct += (predicted == hash_code[:, 1]).sum().item()
+        total += hash_code[:, 1].size(0)
+
+    accuracy = correct / total
+    return total_loss / len(train_loader), accuracy
+
+
+def evaluate(model, criterion, val_loader, device):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for mfcc, hash_code in val_loader:
+            mfcc, hash_code = mfcc.to(device), hash_code.to(device)
+            output = model(mfcc, hash_code[:, :-1])
+            loss = criterion(output, hash_code[:, 1:])
+            total_loss += loss.item()
+            predicted = torch.argmax(output, dim=1)
+            correct += (predicted == hash_code[:, 1]).sum().item()
+            total += hash_code[:, 1].size(0)
+
+    accuracy = correct / total
+    return total_loss / len(val_loader), accuracy
+# 定义超参数
+batch_size = 32
+num_epochs = 10
+learning_rate = 0.0001
+# 创建模型和优化器
+import torch
+from torch import nn
+from G_MFCC2HashTransformer import MFCC2HashTransformer
+from J_epoch import learning_rate
+
+model = MFCC2HashTransformer(input_dim=40, output_dim=16, num_heads=2, num_layers=2)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+# 定义损失函数和优化器
+criterion = nn.CrossEntropyLoss(ignore_index=0)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+# 导入模型和优化器
+
+from L_MA import model, optimizer, criterion, device
+from I_Train_Evaluate import train, evaluate
+from J_epoch import num_epochs
+from X_Load_data import train_loader, valid_loader, test_loader
+
+# 打印模型信息
+print(model)
+
+# 开始训练
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch + 1}/{num_epochs}")
+    train_loss, train_acc = train(model, optimizer, criterion, train_loader, device)
+    valid_loss, valid_acc = evaluate(model, criterion, valid_loader, device)
+    print('Epoch [{}/{}], Train Loss: {:.4f}, Train Accuracy: {:.4f}, Valid Loss: {:.4f}, Valid Accuracy: {:.4f}'
+          .format(epoch + 1, num_epochs, train_loss, train_acc, valid_loss, valid_acc))
+
+# 在测试集上评估模型性能
+test_loss, test_acc = evaluate(model, criterion, test_loader, device)
+print('Test Loss: {:.4f}, Test Accuracy: {:.4f}'.format(test_loss, test_acc))
